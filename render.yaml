@@ -1,0 +1,13 @@
+# Render Blueprint: New → Blueprint → chọn repo này → Apply
+services:
+  - type: web
+    name: btc-signal-bot
+    runtime: docker
+    plan: free
+    # Không chọn region ở Mỹ: Binance chặn IP Mỹ (lỗi 451)
+    region: frankfurt
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: TZ
+        value: Asia/Ho_Chi_Minh
