@@ -6,6 +6,7 @@ Console.OutputEncoding = Encoding.UTF8;
 
 // Cách chạy: dotnet run -- [SYMBOL] [INTERVAL] [tùy chọn]   ví dụ: dotnet run -- BTCUSDT.P 5m
 //   --preset scalp|swing : chiến lược (mặc định: nến ≤ 5m → scalp, lớn hơn → swing)
+//   --exchange okx|binance : nguồn dữ liệu (mặc định okx)
 //   mặc định       : chart real-time ngay trong console, đánh dấu điểm LONG/SHORT + TP/SL
 //   --log          : chỉ in log từng nến (chế độ cũ)
 //   --session 6h   : chạy thử giao dịch giả lập trong 6 giờ, hết giờ tự tổng kết + xuất Excel
@@ -35,11 +36,14 @@ string? envPort = Environment.GetEnvironmentVariable("PORT");
 TimeSpan? sessionLength = options.TryGetValue("session", out var sl) ? ParseInterval(sl ?? "6h") : null;
 double capital = NumOpt("capital", 1000), stake = NumOpt("stake", 10), leverage = NumOpt("leverage", 1);
 
-// Hậu tố ".P" như TradingView = hợp đồng vĩnh cửu USDⓈ-M (Binance Futures); không có thì là Spot.
+// Hậu tố ".P" như TradingView = hợp đồng vĩnh cửu (Futures); không có thì là Spot.
 string displaySymbol = positional.Count > 0 ? positional[0].ToUpperInvariant() : "BTCUSDT.P";
 bool futures = displaySymbol.EndsWith(".P");
 string symbol = futures ? displaySymbol[..^2] : displaySymbol;
-string market = futures ? "Binance Futures" : "Binance Spot";
+// --exchange okx|binance (mặc định OKX: Binance chặn nhiều máy chủ cloud)
+string exchange = options.TryGetValue("exchange", out var ex0) && ex0 is not null ? ex0.ToLowerInvariant() : "okx";
+using IMarketData client = exchange == "binance" ? new BinanceClient(futures) : new OkxClient(futures);
+string market = client.Market;
 string interval = positional.Count > 1 ? positional[1] : "5m";
 var period = ParseInterval(interval);
 const int HistoryCandles = 5000;   // 5m ≈ 17 ngày, 15m ≈ 52 ngày: đủ làm "ấm" chỉ báo + có dữ liệu để backtest
@@ -70,8 +74,6 @@ Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
 using var sigterm = System.Runtime.InteropServices.PosixSignalRegistration.Create(
     System.Runtime.InteropServices.PosixSignal.SIGTERM, ctx => { ctx.Cancel = true; cts.Cancel(); });
 
-using var client = new BinanceClient(futures);
-
 WebDashboard? dashboard = null;
 if (!replay && (envPort is not null || options.ContainsKey("port")))
 {
@@ -100,7 +102,9 @@ while (true)
         try
         {
             // 1) Lịch sử
+            dashboard?.SetStatus($"Đang tải {HistoryCandles} nến {displaySymbol} {interval} từ {market}…");
             var candles = await client.GetHistoryAsync(symbol, interval, HistoryCandles, cts.Token);
+            if (candles.Count < 300) throw new InvalidOperationException($"{market} chỉ trả về {candles.Count} nến, không đủ để tính chỉ báo");
             Console.WriteLine($"Đã tải {candles.Count} nến {displaySymbol} ({market}) {interval} " +
                               $"({candles[0].OpenTime.ToLocalTime():dd/MM HH:mm} → {candles[^1].OpenTime.ToLocalTime():dd/MM HH:mm})");
 
@@ -239,6 +243,7 @@ while (true)
         catch (Exception ex)
         {
             Console.WriteLine($"\nLỗi: {ex.Message}. Thử lại sau 5 giây...");
+            dashboard?.SetStatus($"Lỗi kết nối {market}: {ex.Message} (thử lại sau 5 giây)", error: true);
         }
 
         try { await Task.Delay(TimeSpan.FromSeconds(5), cts.Token); }
@@ -289,7 +294,7 @@ static Signal? CheckTargetsNow(MacdTrendStrategy strategy, Candle candle, PaperS
 
 /// <returns>true nếu phiên chạy thử đã hết giờ.</returns>
 static async Task<bool> RunChartAsync(
-    BinanceClient client, string symbol, string displaySymbol, string market, string interval, TimeSpan period,
+    IMarketData client, string symbol, string displaySymbol, string market, string interval, TimeSpan period,
     List<Candle> candles, MacdTrendStrategy strategy, List<TradeMarker> markers, StrategySettings settings,
     string note, PaperSession? session, WebDashboard? dashboard, bool headless, CancellationToken ct)
 {

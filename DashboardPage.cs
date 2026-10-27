@@ -431,10 +431,19 @@ async function poll() {
   try {
     const r = await fetch('/api/state', { cache: 'no-store' });
     const st = await r.json();
-    if (st.candles && st.candles.length) { lastState = st; render(st); firstPoll = false; }
-    const stale = Date.now() - st.updated > 15000;
-    $('dot').className = 'live-dot' + (stale ? ' stale' : '');
-    $('clock').textContent = stale ? 'Mất kết nối dữ liệu' : new Date().toLocaleTimeString('vi-VN');
+    if (st.candles && st.candles.length) {
+      lastState = st; render(st); firstPoll = false;
+      const stale = Date.now() - st.updated > 15000;
+      $('dot').className = 'live-dot' + (stale ? ' stale' : '');
+      $('clock').textContent = stale ? 'Mất kết nối dữ liệu' : new Date().toLocaleTimeString('vi-VN');
+    } else if (st.status) {
+      // chưa có dữ liệu: hiện trạng thái tải / lỗi kết nối sàn thay vì để trống
+      const b = $('banner');
+      b.className = 'banner ' + (st.error ? 'short' : 'wait');
+      b.textContent = (st.error ? '⚠ ' : '⏳ ') + st.status;
+      $('dot').className = 'live-dot' + (st.error ? ' stale' : '');
+      $('clock').textContent = st.error ? 'Lỗi dữ liệu' : 'Đang tải…';
+    }
   } catch {
     $('dot').className = 'live-dot stale';
     $('clock').textContent = 'App không chạy';

@@ -10,8 +10,10 @@ namespace BtcSignalBot;
 /// Market data public, không cần API key.
 /// <paramref name="futures"/> = true: hợp đồng vĩnh cửu USDⓈ-M (BTCUSDT.P trên TradingView), ngược lại là Spot.
 /// </summary>
-public sealed class BinanceClient(bool futures) : IDisposable
+public sealed class BinanceClient(bool futures) : IMarketData
 {
+    public string Market => futures ? "Binance Futures" : "Binance Spot";
+
     private readonly string _klinesPath = futures ? "/fapi/v1/klines" : "/api/v3/klines";
     // Futures: stream nến nằm ở /market/ws; đường /ws cũ vẫn kết nối được nhưng không gửi dữ liệu kline.
     private readonly string _wsBase = futures ? "wss://fstream.binance.com/market/ws" : "wss://stream.binance.com:9443/ws";

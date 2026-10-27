@@ -21,6 +21,8 @@ public sealed class WebDashboard : IDisposable
     private readonly HttpListener _listener = new();
     private volatile string _stateJson = "{}";
     private volatile string? _reportPath;
+    private volatile string _statusJson = """{"status":"Đang khởi động…","error":false}""";
+    private volatile bool _hasState;
 
     // Cỡ lệnh dùng để quy đổi vị thế của chiến lược ra ký quỹ / PNL kiểu Binance khi lệnh không thuộc phiên thử
     private readonly double _stake, _leverage, _feePct;
@@ -57,7 +59,9 @@ public sealed class WebDashboard : IDisposable
         {
             var path = ctx.Request.Url?.AbsolutePath ?? "/";
             if (path == "/api/state")
-                Write(ctx, "application/json; charset=utf-8", Encoding.UTF8.GetBytes(_stateJson));
+                Write(ctx, "application/json; charset=utf-8", Encoding.UTF8.GetBytes(_hasState ? _stateJson : _statusJson));
+            else if (path == "/api/status")
+                Write(ctx, "application/json; charset=utf-8", Encoding.UTF8.GetBytes(_statusJson));
             else if (path == "/health")
                 Write(ctx, "text/plain; charset=utf-8", "ok"u8.ToArray());
             else if (path == "/report.xlsx" && _reportPath is { } rp && File.Exists(rp))
@@ -127,9 +131,20 @@ public sealed class WebDashboard : IDisposable
         ctx.Response.Close();
     }
 
+    /// <summary>
+    /// Thông báo khi chưa có dữ liệu (đang tải / lỗi kết nối sàn). Có lỗi thì trang hiện lỗi thay vì đứng trắng;
+    /// khi dữ liệu chạy lại bình thường, Update() sẽ thay thế.
+    /// </summary>
+    public void SetStatus(string message, bool error = false)
+    {
+        _statusJson = JsonSerializer.Serialize(new { status = message, error, time = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() });
+        if (error) _hasState = false;
+    }
+
     /// <summary>Cập nhật trạng thái từ khung hình chart (gọi từ vòng lặp chính, ~2 lần/giây).</summary>
     public void Update(ChartFrame f, PaperSession? session)
     {
+        _hasState = true;
         _reportPath = session is not null && File.Exists(session.ReportPath) ? session.ReportPath : null;
 
         int start = Math.Max(0, f.Candles.Count - MaxCandles);
