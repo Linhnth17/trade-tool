@@ -117,7 +117,7 @@ while (true)
             Console.WriteLine($"  Max drawdown: {bt.MaxDrawdownPct:F2}%  (đã tính phí {settings.FeePct:0.00#%}/chiều)");
             Console.WriteLine("─────────────────────────────────────────");
 
-            // --diag: trong các nến có MACD cắt, điều kiện nào chặn lệnh nhiều nhất (để chỉnh bộ lọc)
+            // --diag: trong các nến có tín hiệu điểm vào, điều kiện nào chặn lệnh nhiều nhất (để chỉnh bộ lọc)
             if (options.ContainsKey("diag"))
             {
                 var ds = new IndicatorSeries(candles, settings);
@@ -130,19 +130,21 @@ while (true)
                     if (!x.IsReady) continue;
                     ready++;
                     if (probe.Regime(x).Sideway) sidewayBars++;
+                    // Classic: điều kiện đầu là MACD cắt; các chế độ mới: điều kiện thứ 3 là điểm vào
+                    int trig = settings.EntryMode == EntryModes.Classic ? 0 : 2;
                     foreach (var conds in new[] { probe.LongConditions(x), probe.ShortConditions(x) })
                     {
-                        if (!conds[0].Ok) continue; // chỉ xét nến có MACD cắt đúng chiều
+                        if (!conds[trig].Ok) continue; // chỉ xét nến có tín hiệu điểm vào đúng chiều
                         crosses++;
                         if (conds.All(c => c.Ok)) passed++;
-                        foreach (var c in conds.Skip(1).Where(c => !c.Ok))
+                        foreach (var c in conds.Where((c, k) => k != trig && !c.Ok))
                         {
                             string key = c.Name.Replace("<", "").Replace(">", "").Trim();
                             fails[key] = fails.GetValueOrDefault(key) + 1;
                         }
                     }
                 }
-                Console.WriteLine($"Sideway: {sidewayBars}/{ready} nến ({(double)sidewayBars / ready:P0}). MACD cắt: {crosses}, đủ điều kiện: {passed}");
+                Console.WriteLine($"Sideway: {sidewayBars}/{ready} nến ({(double)sidewayBars / ready:P0}). Chế độ {settings.EntryMode}: có tín hiệu điểm vào {crosses}, đủ điều kiện: {passed}");
                 foreach (var (k, v) in fails.OrderByDescending(kv => kv.Value)) Console.WriteLine($"  {v,4} ({(double)v / crosses,4:P0})  {k}");
                 break;
             }

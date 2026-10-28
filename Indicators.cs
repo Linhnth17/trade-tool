@@ -228,8 +228,18 @@ public sealed record IndicatorSnapshot(
     double SwingLow,      // đáy thấp nhất N nến gần nhất (gồm nến này) — chỗ đặt SL lệnh Long
     double SwingHigh,     // đỉnh cao nhất N nến gần nhất — chỗ đặt SL lệnh Short
     double RangeHigh,     // đỉnh cao nhất M nến TRƯỚC đó — kháng cự gần nhất cho TP lệnh Long
-    double RangeLow)      // đáy thấp nhất M nến trước đó — hỗ trợ gần nhất cho TP lệnh Short
+    double RangeLow,      // đáy thấp nhất M nến trước đó — hỗ trợ gần nhất cho TP lệnh Short
+    // ── Cho điểm vào kiểu "cửa sổ" / pullback ──
+    double Open,
+    double PrevHigh,
+    double PrevLow,
+    int BarsSinceCrossUp,     // số nến từ lần MACD histogram cắt lên 0 gần nhất (0 = chính nến này)
+    int BarsSinceCrossDown,
+    int BarsSinceTouchLong,   // số nến từ lần giá (đáy nến) chạm/xuyên EMA nhanh gần nhất — nhịp hồi trong xu hướng tăng
+    int BarsSinceTouchShort)  // số nến từ lần đỉnh nến chạm/vượt EMA nhanh — nhịp hồi trong xu hướng giảm
 {
+    public const int Never = 9999;
+
     public bool IsReady =>
         !double.IsNaN(EmaSlow) && !double.IsNaN(Hist) && !double.IsNaN(PrevHist) && !double.IsNaN(Rsi)
         && !double.IsNaN(Atr) && !double.IsNaN(Adx) && !double.IsNaN(Chop) && !double.IsNaN(RangeHigh);
@@ -241,6 +251,7 @@ public sealed class IndicatorSeries
     private readonly IReadOnlyList<Candle> _candles;
     private readonly double[] _emaFast, _emaSlow, _macd, _signal, _hist, _rsi, _atr, _adx, _pdi, _mdi, _chop,
         _bbUp, _bbLo, _volRatio, _swingLow, _swingHigh, _rangeHigh, _rangeLow;
+    private readonly int[] _sinceCrossUp, _sinceCrossDown, _sinceTouchLong, _sinceTouchShort;
 
     public IndicatorSeries(IReadOnlyList<Candle> candles, StrategySettings s)
     {
@@ -263,6 +274,26 @@ public sealed class IndicatorSeries
         _swingHigh = Indicators.RollingMax(high, s.SwingLookback);
         _rangeHigh = Indicators.RollingMax(high, s.RangeLookback, skip: 1);
         _rangeLow = Indicators.RollingMin(low, s.RangeLookback, skip: 1);
+
+        // Đếm số nến kể từ sự kiện gần nhất (để điểm vào không bắt buộc rơi đúng một nến)
+        int n = candles.Count;
+        _sinceCrossUp = new int[n];
+        _sinceCrossDown = new int[n];
+        _sinceTouchLong = new int[n];
+        _sinceTouchShort = new int[n];
+        int up = IndicatorSnapshot.Never, down = IndicatorSnapshot.Never, tl = IndicatorSnapshot.Never, ts = IndicatorSnapshot.Never;
+        for (int i = 0; i < n; i++)
+        {
+            up = up == IndicatorSnapshot.Never ? up : up + 1;
+            down = down == IndicatorSnapshot.Never ? down : down + 1;
+            tl = tl == IndicatorSnapshot.Never ? tl : tl + 1;
+            ts = ts == IndicatorSnapshot.Never ? ts : ts + 1;
+            if (i > 0 && _hist[i - 1] <= 0 && _hist[i] > 0) up = 0;
+            if (i > 0 && _hist[i - 1] >= 0 && _hist[i] < 0) down = 0;
+            if (low[i] <= _emaFast[i]) tl = 0;
+            if (high[i] >= _emaFast[i]) ts = 0;
+            (_sinceCrossUp[i], _sinceCrossDown[i], _sinceTouchLong[i], _sinceTouchShort[i]) = (up, down, tl, ts);
+        }
     }
 
     public int Count => _candles.Count;
@@ -282,5 +313,9 @@ public sealed class IndicatorSeries
         _atr[i],
         _adx[i], _pdi[i], _mdi[i], _chop[i],
         _bbUp[i], _bbLo[i], _volRatio[i],
-        _swingLow[i], _swingHigh[i], _rangeHigh[i], _rangeLow[i]);
+        _swingLow[i], _swingHigh[i], _rangeHigh[i], _rangeLow[i],
+        _candles[i].Open,
+        i > 0 ? _candles[i - 1].High : double.NaN,
+        i > 0 ? _candles[i - 1].Low : double.NaN,
+        _sinceCrossUp[i], _sinceCrossDown[i], _sinceTouchLong[i], _sinceTouchShort[i]);
 }

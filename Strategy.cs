@@ -38,6 +38,18 @@ public sealed class StrategySettings
 
     public double FeePct { get; init; } = 0.001;       // 0.1% mỗi chiều (Spot); Futures taker ~0.05%
 
+    // ── Điểm vào lệnh ──
+    /// <summary>
+    /// Classic : bản cũ — đủ 10 điều kiện trên ĐÚNG nến MACD cắt.
+    /// Window  : chỉ báo chia vai trò; điểm vào = MACD cắt trong SignalWindow nến gần nhất.
+    /// Pullback: chỉ báo chia vai trò; điểm vào = giá hồi về EMA nhanh rồi bật lại theo xu hướng.
+    /// Combo   : Window HOẶC Pullback.
+    /// </summary>
+    public string EntryMode { get; init; } = EntryModes.Combo;
+    public int SignalWindow { get; init; } = 3;        // MACD cắt trong 3 nến gần nhất vẫn tính
+    public int PullbackLookback { get; init; } = 3;    // giá chạm EMA nhanh trong 3 nến gần nhất
+    public int CooldownBars { get; init; } = 3;        // đóng lệnh xong nghỉ 3 nến mới vào lệnh mới
+
     /// <summary>
     /// false (mặc định): lệnh chỉ đóng khi chạm TP hoặc SL.
     /// true: thoát sớm thêm khi MACD cắt ngược chiều / giá đóng cửa vượt ngược EMA chậm.
@@ -57,11 +69,22 @@ public sealed class StrategySettings
         // Volume 5m rất lệch (vài nến đột biến kéo trung bình lên), so với trung bình gốc thì đa số nến "dưới TB":
         // chỉ loại nến volume thấp hẳn (< 0.8× TB) thay vì đòi ≥ TB.
         MinVolumeRatio = 0.8,
+        // Backtest 17 ngày 5m (OKX + Binance): Combo có lợi thế trước phí (+1.3% / +3.1%, ~100 lệnh) nhưng phí taker
+        // ăn hết vì sóng 5m nhỏ. Chỉ nhận lệnh có TP ≥ 4× phí 2 chiều thì mới dương sau phí (+0.17% / +0.42%, ~15 lệnh).
+        EntryMode = EntryModes.Combo,
+        MinTpFeeMultiple = 4,
         FeePct = feePct,
     };
 
-    /// <summary>Giữ lệnh dài hơn trên nến 15m trở lên.</summary>
-    public static StrategySettings Swing(double feePct) => new() { FeePct = feePct };
+    /// <summary>
+    /// Giữ lệnh dài hơn trên nến 15m trở lên. Backtest 15m: Combo (−6.81%) kém Classic (−3.82%) nên giữ Classic.
+    /// </summary>
+    public static StrategySettings Swing(double feePct) => new() { FeePct = feePct, EntryMode = EntryModes.Classic };
+}
+
+public static class EntryModes
+{
+    public const string Classic = "Classic", Window = "Window", Pullback = "Pullback", Combo = "Combo";
 }
 
 public enum Side { Long, Short }
@@ -212,7 +235,77 @@ public sealed class MacdTrendStrategy(StrategySettings s)
     /// <summary>Từng điều kiện SHORT, đối xứng với LONG.</summary>
     public IReadOnlyList<(string Name, bool Ok)> ShortConditions(IndicatorSnapshot x) => Conditions(Side.Short, x);
 
-    private List<(string Name, bool Ok)> Conditions(Side side, IndicatorSnapshot x)
+    /// <summary>
+    /// Điểm vào theo chế độ đang dùng (null nếu chưa có). Dùng chung cho chiến lược và ghi chú lệnh.
+    ///  MACD: histogram cắt qua 0 trong SignalWindow nến gần nhất và vẫn còn cùng phía.
+    ///  Pullback: trong PullbackLookback nến gần nhất giá đã hồi chạm EMA nhanh, nến này bật lại:
+    ///            đóng cửa vượt EMA nhanh, nến cùng màu xu hướng, vượt đỉnh (Long) / đáy (Short) nến trước.
+    /// </summary>
+    public static string? Trigger(Side side, IndicatorSnapshot x, StrategySettings s)
+    {
+        bool isLong = side == Side.Long;
+        if (s.EntryMode is EntryModes.Window or EntryModes.Combo)
+        {
+            int since = isLong ? x.BarsSinceCrossUp : x.BarsSinceCrossDown;
+            if (since < s.SignalWindow && (isLong ? x.Hist > 0 : x.Hist < 0))
+                return since == 0
+                    ? $"MACD vừa cắt {(isLong ? "lên" : "xuống")} 0 ngay nến này"
+                    : $"MACD cắt {(isLong ? "lên" : "xuống")} 0 cách đây {since} nến, histogram vẫn {(isLong ? "dương" : "âm")}";
+        }
+        if (s.EntryMode is EntryModes.Pullback or EntryModes.Combo)
+        {
+            int touch = isLong ? x.BarsSinceTouchLong : x.BarsSinceTouchShort;
+            bool bounce = isLong
+                ? x.Close > x.EmaFast && x.Close > x.Open && x.Close > x.PrevHigh
+                : x.Close < x.EmaFast && x.Close < x.Open && x.Close < x.PrevLow;
+            if (touch < s.PullbackLookback && bounce)
+                return isLong
+                    ? $"Pullback: giá hồi chạm EMA{s.FastEma} {(touch == 0 ? "ngay nến này" : $"cách đây {touch} nến")} rồi bật lên, " +
+                      "nến tăng đóng cửa vượt đỉnh nến trước"
+                    : $"Pullback: giá hồi chạm EMA{s.FastEma} {(touch == 0 ? "ngay nến này" : $"cách đây {touch} nến")} rồi bị đẩy xuống, " +
+                      "nến giảm đóng cửa thủng đáy nến trước";
+        }
+        return null;
+    }
+
+    private List<(string Name, bool Ok)> Conditions(Side side, IndicatorSnapshot x) =>
+        s.EntryMode == EntryModes.Classic ? ClassicConditions(side, x) : RoleConditions(side, x);
+
+    /// <summary>
+    /// Mỗi nhóm chỉ báo một vai trò, không lặp nhau:
+    ///  1. Có nên giao dịch: ADX + CHOP (lọc sideway)
+    ///  2. Đánh chiều nào: EMA nhanh/chậm
+    ///  3. Vào lúc nào: Trigger() — có cửa sổ vài nến, không bắt buộc đúng một nến
+    ///  4. Chưa quá mua/bán: RSI
+    ///  5-6. Có đáng vào không: R:R và TP đủ bù phí
+    /// Volume và +DI/−DI không còn bắt buộc (trùng vai trò / quá nhiễu ở nến nhỏ), chỉ ghi vào ghi chú để tham khảo.
+    /// </summary>
+    private List<(string Name, bool Ok)> RoleConditions(Side side, IndicatorSnapshot x)
+    {
+        bool isLong = side == Side.Long;
+        var plan = x.IsReady ? Plan(side, x) : null;
+        double tpPct = plan is null ? 0 : Math.Abs(plan.TakeProfit / plan.Entry - 1);
+        string triggerName = s.EntryMode switch
+        {
+            EntryModes.Window => $"MACD cắt {(isLong ? "lên" : "xuống")} ≤ {s.SignalWindow} nến",
+            EntryModes.Pullback => $"Pullback EMA{s.FastEma}",
+            _ => $"Điểm vào: MACD ≤ {s.SignalWindow} nến / pullback EMA{s.FastEma}",
+        };
+        return
+        [
+            ($"Có xu hướng (ADX ≥ {s.AdxMin:F0}, CHOP ≤ {s.ChopMax:0.#})", x.Adx >= s.AdxMin && x.Chop <= s.ChopMax),
+            ($"Xu hướng {(isLong ? "tăng" : "giảm")}: EMA{s.FastEma} {(isLong ? ">" : "<")} EMA{s.SlowEma}, giá {(isLong ? "trên" : "dưới")} EMA{s.SlowEma}",
+                isLong ? x.EmaFast > x.EmaSlow && x.Close > x.EmaSlow : x.EmaFast < x.EmaSlow && x.Close < x.EmaSlow),
+            (triggerName, Trigger(side, x, s) is not null),
+            (isLong ? $"RSI < {s.RsiOverbought:F0}" : $"RSI > {s.RsiOversold:F0}",
+                isLong ? x.Rsi < s.RsiOverbought : x.Rsi > s.RsiOversold),
+            ($"R:R ≥ {s.MinRR:0.0#}", plan is not null && plan.RiskReward >= s.MinRR),
+            ($"TP ≥ {s.MinTpFeeMultiple:0.#}× phí", tpPct >= s.MinTpFeeMultiple * 2 * s.FeePct),
+        ];
+    }
+
+    /// <summary>Bản cũ: đủ 10 điều kiện trên đúng nến MACD cắt (giữ lại để so sánh).</summary>
+    private List<(string Name, bool Ok)> ClassicConditions(Side side, IndicatorSnapshot x)
     {
         bool isLong = side == Side.Long;
         var plan = x.IsReady ? Plan(side, x) : null;
@@ -233,10 +326,15 @@ public sealed class MacdTrendStrategy(StrategySettings s)
         ];
     }
 
+    /// <summary>Số nến đã đóng kể từ lần đóng lệnh gần nhất (để nghỉ CooldownBars nến).</summary>
+    private int _barsSinceExit = int.MaxValue / 2;
+
     private List<Signal> Step(IndicatorSnapshot x, bool commit)
     {
         var signals = new List<Signal>(2);
         if (!x.IsReady) return signals;
+        int barsSinceExit = _barsSinceExit + 1; // nến đang xét
+        if (commit) _barsSinceExit = barsSinceExit;
 
         bool flat = Position is null;
         if (Position is { } side && CheckExit(x, side) is { } exit)
@@ -244,8 +342,13 @@ public sealed class MacdTrendStrategy(StrategySettings s)
             signals.Add(exit);
             flat = true;
             if (commit) Position = null;
+            barsSinceExit = 0;
+            if (commit) _barsSinceExit = 0;
         }
         if (!flat) return signals;
+        // Vừa đóng lệnh: nghỉ vài nến, tránh vào lại liên tục trong cùng một nhịp giá
+        // (Classic giữ nguyên hành vi cũ để so sánh công bằng)
+        if (s.EntryMode != EntryModes.Classic && barsSinceExit <= s.CooldownBars) return signals;
 
         Side? open =
             LongConditions(x).All(c => c.Ok) ? Side.Long :
@@ -262,9 +365,11 @@ public sealed class MacdTrendStrategy(StrategySettings s)
             StopLoss = plan.StopLoss;
             TakeProfit = plan.TakeProfit;
         }
-        string reason = o == Side.Long
-            ? $"MACD cắt lên, xu hướng tăng (ADX {x.Adx:F0}), RSI {x.Rsi:F1}, R:R 1:{plan.RiskReward:0.0#}"
-            : $"MACD cắt xuống, xu hướng giảm (ADX {x.Adx:F0}), RSI {x.Rsi:F1}, R:R 1:{plan.RiskReward:0.0#}";
+        string trigger = s.EntryMode == EntryModes.Classic
+            ? (o == Side.Long ? "MACD cắt lên" : "MACD cắt xuống")
+            : Trigger(o, x, s) ?? "";
+        string reason = $"{trigger}; xu hướng {(o == Side.Long ? "tăng" : "giảm")} (ADX {x.Adx:F0}), " +
+                        $"RSI {x.Rsi:F1}, R:R 1:{plan.RiskReward:0.0#}";
         signals.Add(new Signal(SignalType.Open, o, reason, x.Close, plan.TakeProfit, plan.StopLoss, Context: x, Plan: plan));
         return signals;
     }
@@ -278,6 +383,7 @@ public sealed class MacdTrendStrategy(StrategySettings s)
     {
         if (Position is not { } side || TargetHit(side, high, low) is not { } exit) return null;
         Position = null;
+        _barsSinceExit = -1; // lúc nến này đóng sẽ thành 0 → bắt đầu tính thời gian nghỉ
         return exit;
     }
 

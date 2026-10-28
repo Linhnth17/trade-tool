@@ -25,6 +25,22 @@ public static class TradeNotes
         // ── 1. Vì sao vào lệnh ──
         var why = new List<string>();
         if (x is null) why.Add(open.Reason);
+        else if (s.EntryMode != EntryModes.Classic)
+        {
+            // Theo vai trò: có xu hướng → đánh chiều nào → vào lúc nào → còn dư địa không
+            why.Add($"① Có xu hướng, không sideway: ADX {x.Adx:F0} ≥ {s.AdxMin:F0} và Choppiness {x.Chop:F0} ≤ {s.ChopMax:0.#}.");
+            why.Add(isLong
+                ? $"② Chiều LONG: EMA{s.FastEma} ({x.EmaFast:N2}) > EMA{s.SlowEma} ({x.EmaSlow:N2}) và giá nằm trên EMA{s.SlowEma}, " +
+                  "nên chỉ mua thuận xu hướng."
+                : $"② Chiều SHORT: EMA{s.FastEma} ({x.EmaFast:N2}) < EMA{s.SlowEma} ({x.EmaSlow:N2}) và giá nằm dưới EMA{s.SlowEma}, " +
+                  "nên chỉ bán thuận xu hướng.");
+            why.Add($"③ Điểm vào: {MacdTrendStrategy.Trigger(open.Side, x, s) ?? open.Reason}.");
+            why.Add(isLong
+                ? $"④ RSI {x.Rsi:F1} < {s.RsiOverbought:F0}: chưa quá mua, giá còn dư địa để tăng."
+                : $"④ RSI {x.Rsi:F1} > {s.RsiOversold:F0}: chưa quá bán, giá còn dư địa để giảm.");
+            why.Add($"Tham khảo (không bắt buộc): volume {x.VolumeRatio:0.0}× trung bình, " +
+                    $"+DI {x.PlusDi:F0} / −DI {x.MinusDi:F0}.");
+        }
         else if (isLong)
         {
             why.Add($"MACD histogram cắt lên trên 0 (nến trước {x.PrevHist:F2} → nến này {x.Hist:F2}): " +
@@ -45,7 +61,7 @@ public static class TradeNotes
                     "→ chỉ bán thuận xu hướng, không bắt đỉnh.");
             why.Add($"RSI {x.Rsi:F1} > {s.RsiOversold:F0}: chưa quá bán, giá còn dư địa để giảm.");
         }
-        if (x is not null && !double.IsNaN(x.Adx))
+        if (x is not null && !double.IsNaN(x.Adx) && s.EntryMode == EntryModes.Classic)
         {
             why.Add($"Không phải sideway: ADX {x.Adx:F0} ≥ {s.AdxMin:F0} (thị trường có xu hướng rõ) và " +
                     $"Choppiness {x.Chop:F0} ≤ {s.ChopMax:0.#} (giá đang chạy một chiều, không giằng co).");
