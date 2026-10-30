@@ -138,7 +138,7 @@ public static class DashboardPage
 
     <div class="card" id="sessionCard">
       <h3>Phiên chạy thử</h3>
-      <div id="session" class="muted">Không có phiên chạy thử (chạy app với --session 6h).</div>
+      <div id="session" class="muted">Không có phiên chạy thử (chạy app với --continuous hoặc --session 6h).</div>
     </div>
   </aside>
 
@@ -300,8 +300,10 @@ function render(st) {
       <div class="equity num ${cls(change)}">${fmt(s.equity)}$</div>
       <div class="num"><span class="${cls(change)}">${pct(change, 3)}</span>
         <span class="muted"> so với vốn ${fmt(s.capital)}$</span></div>
-      <div class="bar"><div style="width:${(done * 100).toFixed(1)}%"></div></div>
-      <div class="muted num">${s.remaining > 0 ? 'Còn ' + dur(s.remaining) : s.open ? 'Hết giờ — chờ lệnh đang mở chạm TP/SL' : 'Đã kết thúc'} · ${hhmm(s.start)} → ${hhmm(s.end)}</div>
+      ${s.continuous
+        ? `<div class="muted num" style="margin-top:8px">Chạy liên tục từ ${hhmm(s.start)} (${esc(s.uptime)}) · ${s.totalTrades} lệnh, tất cả lưu trong 1 file Excel</div>`
+        : `<div class="bar"><div style="width:${(done * 100).toFixed(1)}%"></div></div>
+           <div class="muted num">${s.remaining > 0 ? 'Còn ' + dur(s.remaining) : s.open ? 'Hết giờ — chờ lệnh đang mở chạm TP/SL' : 'Đã kết thúc'} · ${hhmm(s.start)} → ${hhmm(s.end)}</div>`}
       <div class="kv num">
         <span>Mỗi lệnh</span><span>${fmt(s.stake)}$ × ${s.leverage}x = ${fmt(s.stake * s.leverage)}$</span>
         <span>Phí 1 lệnh (2 chiều)</span><span>~${fmt(s.stake * s.leverage * s.fee * 2)}$</span>

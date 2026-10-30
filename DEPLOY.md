@@ -1,6 +1,7 @@
 # Chạy bot 24/7 miễn phí trên Render
 
-Bot chạy dạng Docker, dashboard có địa chỉ web công khai. Mỗi phiên 24h, hết phiên tự xuất Excel rồi mở phiên mới.
+Bot chạy dạng Docker, dashboard có địa chỉ web công khai. Giao dịch giả lập chạy liên tục không nghỉ (`--continuous`),
+mọi lệnh ghi vào **một** file Excel `reports/BTCUSDT.P_5m_all.xlsx`. Dữ liệu giá lấy từ OKX (`--exchange okx`).
 
 ## 1. Đưa code lên GitHub
 
@@ -39,15 +40,22 @@ Gói free có 750 giờ/tháng, đủ cho 1 app chạy liên tục cả tháng (
 Sửa dòng `CMD` cuối `Dockerfile` rồi push lại (Render tự deploy lại), ví dụ:
 
 ```
-CMD ["BTCUSDT.P", "5m", "--session", "24h", "--repeat", "--capital", "1000", "--stake", "10", "--leverage", "100", "--headless"]
+CMD ["BTCUSDT.P", "5m", "--continuous", "--capital", "1000", "--stake", "10", "--leverage", "100", "--headless"]
 ```
 
 Hoặc trên Render: service → **Settings → Docker Command**.
 
+## Chạy liên tục và file Excel
+
+- Không có reset theo ngày: bot chạy mãi, lệnh mới được nối vào cùng một file.
+- Khi app khởi động lại mà **file vẫn còn trên đĩa**, bot đọc lại toàn bộ lệnh cũ (kể cả lệnh đang mở) và chạy tiếp.
+  Tắt app không đóng lệnh đang mở: lần chạy sau lệnh đó vẫn được theo dõi tới khi chạm TP/SL.
+
 ## Giới hạn của gói free
 
-- **File Excel không giữ lâu dài**: mỗi lần app khởi động lại / deploy lại là mất. Tải về định kỳ ở trang `/reports`.
-- Khởi động lại thì phiên đang chạy dở bị đóng và mở phiên mới.
+- **Ổ đĩa không giữ lâu dài**: mỗi lần Render deploy lại / khởi động lại app là file Excel mất, bot bắt đầu lại từ đầu.
+  Tải file về định kỳ ở trang `/reports`. Muốn giữ lịch sử qua các lần khởi động lại cần ổ đĩa lâu dài
+  (Render Disk — gói trả phí) hoặc lưu lệnh vào một database miễn phí bên ngoài.
 - CPU yếu (0.1 vCPU): dashboard cập nhật mỗi 2 giây thay vì 0.5 giây.
 - Ai có link đều xem được dashboard (không có mật khẩu). Bot chỉ đọc dữ liệu công khai, không có API key, không đặt lệnh thật.
 

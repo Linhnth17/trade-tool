@@ -26,7 +26,16 @@ public sealed class PaperTrade
     public double Pnl { get; set; }          // lãi/lỗ ròng sau phí ($)
     public double EquityAfter { get; set; }
 
+    /// <summary>Ghi chú đọc lại từ file Excel (lệnh khôi phục sau khi khởi động lại không còn số liệu chỉ báo gốc).</summary>
+    public string? SavedNotes { get; init; }
+
     public bool IsOpen => ExitTime is null;
+
+    /// <summary>Ghi chú của lệnh: dựng lại từ chỉ báo nếu còn, không thì dùng bản đã lưu trong Excel.</summary>
+    public List<NoteSection> Notes(StrategySettings s, double leverage, double feePct) =>
+        EntrySignal.Context is null && SavedNotes is not null
+            ? [new NoteSection("Ghi chú (đọc lại từ file Excel)", SavedNotes.Split('\n', StringSplitOptions.RemoveEmptyEntries))]
+            : TradeNotes.Explain(EntrySignal, s, Margin, leverage, feePct, Outcome, ExitReason, ExitPrice, IsOpen ? null : Pnl);
 
     public double GrossPnl(double price) =>
         Side == Side.Long ? Quantity * (price - EntryPrice) : Quantity * (EntryPrice - price);
@@ -34,7 +43,7 @@ public sealed class PaperTrade
 
 /// <summary>
 /// Tài khoản giả lập: vốn ban đầu cố định, mỗi lệnh dùng một khoản tiền cố định (không gộp lãi),
-/// tính phí 2 chiều. Chỉ nhận lệnh mở trong khoảng [Start, End).
+/// tính phí 2 chiều. Chỉ nhận lệnh mở trong khoảng [Start, End). End = MaxValue: chạy liên tục, không bao giờ hết phiên.
 /// Có đòn bẩy (isolated margin): giá đi ngược ~(1/đòn bẩy − tỷ lệ ký quỹ duy trì) là bị THANH LÝ, mất hết margin.
 /// </summary>
 public sealed class PaperAccount(
@@ -58,6 +67,7 @@ public sealed class PaperAccount(
     }
     public DateTimeOffset Start => start;
     public DateTimeOffset End => end;
+    public bool Continuous => end == DateTimeOffset.MaxValue;
 
     public List<PaperTrade> Trades { get; } = [];
     public PaperTrade? Open => Trades.Count > 0 && Trades[^1].IsOpen ? Trades[^1] : null;
@@ -71,22 +81,31 @@ public sealed class PaperAccount(
         : 0);
 
     /// <summary>
-    /// Kiểm tra thanh lý trên một nến đã đóng (gọi TRƯỚC khi xử lý tín hiệu của nến đó).
-    /// Chỉ xảy ra khi giá thanh lý gần giá vào hơn SL — nếu SL gần hơn thì SL khớp trước.
+    /// Kiểm tra thanh lý rồi TP/SL theo giá của chính lệnh (gọi với nến đang chạy hoặc vừa đóng,
+    /// TRƯỚC khi xử lý tín hiệu). Thanh lý chỉ xảy ra khi giá thanh lý gần giá vào hơn SL.
+    /// Tự kiểm tra TP/SL (không chỉ chờ tín hiệu của chiến lược) để lệnh khôi phục từ Excel sau khi
+    /// khởi động lại vẫn được đóng đúng, kể cả khi trạng thái chiến lược tính lại không còn giữ lệnh đó.
     /// </summary>
-    public void OnCandle(Candle c, DateTimeOffset closeTime)
+    public void OnCandle(Candle c, DateTimeOffset time)
     {
         if (Open is not { } o) return;
-        bool liqBeforeSl = o.Side == Side.Long ? o.LiquidationPrice > o.StopLoss : o.LiquidationPrice < o.StopLoss;
-        bool hit = o.Side == Side.Long ? c.Low <= o.LiquidationPrice : c.High >= o.LiquidationPrice;
-        if (!liqBeforeSl || !hit) return;
+        bool isLong = o.Side == Side.Long;
+        bool liqBeforeSl = isLong ? o.LiquidationPrice > o.StopLoss : o.LiquidationPrice < o.StopLoss;
+        bool liqHit = isLong ? c.Low <= o.LiquidationPrice : c.High >= o.LiquidationPrice;
+        if (liqBeforeSl && liqHit)
+        {
+            o.ExitTime = time;
+            o.ExitPrice = o.LiquidationPrice;
+            o.Outcome = "THANH LÝ";
+            o.ExitReason = $"Giá chạm mức thanh lý (đòn bẩy {leverage:0.#}x)";
+            o.Pnl = -o.Margin - o.Fees; // mất toàn bộ margin + phí mở lệnh
+            o.EquityAfter = Balance;
+            return;
+        }
 
-        o.ExitTime = closeTime;
-        o.ExitPrice = o.LiquidationPrice;
-        o.Outcome = "THANH LÝ";
-        o.ExitReason = $"Giá chạm mức thanh lý (đòn bẩy {leverage:0.#}x)";
-        o.Pnl = -o.Margin - o.Fees; // mất toàn bộ margin + phí mở lệnh
-        o.EquityAfter = Balance;
+        // Nến chạm cả SL và TP: không biết cái nào trước -> giả định xấu nhất là SL (giống chiến lược)
+        if (isLong ? c.Low <= o.StopLoss : c.High >= o.StopLoss) CloseOpen(time, o.StopLoss, "SL", "Chạm SL");
+        else if (isLong ? c.High >= o.TakeProfit : c.Low <= o.TakeProfit) CloseOpen(time, o.TakeProfit, "TP", "Chạm TP");
     }
 
     /// <summary>Nhận tín hiệu từ chiến lược. <paramref name="time"/> = lúc nến tín hiệu ĐÓNG.</summary>
@@ -175,11 +194,15 @@ public sealed class PaperSession(
         var left = account.End - now;
         double eq = account.Equity(LastPrice);
         string open = account.Open is { } o ? $", đang mở {(o.Side == Side.Long ? "LONG" : "SHORT")}" : "";
-        string time = left > TimeSpan.Zero ? $"còn {left:hh\\:mm\\:ss}" : "HẾT GIỜ, chờ lệnh chạm TP/SL";
+        string time = account.Continuous
+            ? $"chạy liên tục từ {account.Start.ToLocalTime():dd/MM HH:mm} ({Uptime(now - account.Start)})"
+            : left > TimeSpan.Zero ? $"còn {left:hh\\:mm\\:ss}" : "HẾT GIỜ, chờ lệnh chạm TP/SL";
         return $"PHIÊN THỬ: {time} │ " +
                $"x{account.Leverage:0.#} · Vốn {account.InitialCapital:N2}$ → {eq:N2}$ ({(eq / account.InitialCapital - 1):+0.000%;-0.000%}) │ " +
                $"{account.Closed.Count()} lệnh đã đóng{open}";
     }
+
+    public static string Uptime(TimeSpan t) => t.TotalDays >= 1 ? $"{(int)t.TotalDays} ngày {t.Hours} giờ" : $"{t.Hours} giờ {t.Minutes} phút";
 
     public void PrintSummary(DateTimeOffset end)
     {
@@ -231,7 +254,7 @@ public static class ExcelReport
         {
             ("Sàn", market, null),
             ("Bắt đầu", acc.Start.ToLocalTime().DateTime, Time),
-            ("Kết thúc", endTime.ToLocalTime().DateTime, Time),
+            (acc.Continuous ? "Cập nhật lúc" : "Kết thúc", endTime.ToLocalTime().DateTime, Time),
             ("Thời lượng (giờ)", Math.Round((endTime - acc.Start).TotalHours, 2), "0.00"),
             ("", "", null),
             ("Vốn ban đầu", acc.InitialCapital, Money),
@@ -324,8 +347,9 @@ public static class ExcelReport
             wt.Cell(r, 20).Value = t.LiquidationPrice;
             wt.Cell(r, 21).Value = Math.Abs(t.TakeProfit - t.EntryPrice) / Math.Abs(t.EntryPrice - t.StopLoss);
             wt.Cell(r, 21).Style.NumberFormat.Format = "\"1:\"0.00";
-            wt.Cell(r, 22).Value = TradeNotes.ToText(TradeNotes.Explain(t.EntrySignal, s, t.Margin, acc.Leverage, acc.FeePct,
-                t.Outcome, t.ExitReason, t.ExitPrice, t.IsOpen ? null : t.Pnl));
+            wt.Cell(r, 22).Value = t.EntrySignal.Context is null && t.SavedNotes is not null
+                ? t.SavedNotes
+                : TradeNotes.ToText(t.Notes(s, acc.Leverage, acc.FeePct));
             wt.Cell(r, 22).Style.Alignment.SetWrapText(true).Alignment.SetVertical(XLAlignmentVerticalValues.Top);
 
             wt.Cell(r, 2).Style.Font.SetFontColor(t.Side == Side.Long ? XLColor.FromHtml("#107C41") : XLColor.FromHtml("#C00000"));
@@ -350,5 +374,67 @@ public static class ExcelReport
         if (acc.Trades.Count > 0) wt.Rows(2, r - 1).AdjustToContents();
 
         wb.SaveAs(path);
+    }
+
+    /// <summary>
+    /// Đọc lại file do <see cref="Save"/> ghi: thời điểm bắt đầu, giá lúc bắt đầu và toàn bộ lệnh
+    /// (để chạy liên tục: khởi động lại vẫn nối tiếp vào cùng một file).
+    /// </summary>
+    public static (DateTimeOffset Start, double StartPrice, List<PaperTrade> Trades) Load(string path)
+    {
+        using var wb = new XLWorkbook(path);
+
+        var summary = wb.Worksheet("Tổng kết");
+        DateTimeOffset? start = null;
+        double startPrice = double.NaN;
+        foreach (var row in summary.RowsUsed())
+        {
+            string label = row.Cell(1).GetString();
+            if (label == "Bắt đầu") start = new DateTimeOffset(row.Cell(2).GetDateTime(), TimeZoneInfo.Local.GetUtcOffset(row.Cell(2).GetDateTime()));
+            else if (label.StartsWith("Giá ") && label.EndsWith("lúc bắt đầu")) startPrice = row.Cell(2).GetDouble();
+        }
+        if (start is null) throw new InvalidDataException("Không tìm thấy dòng \"Bắt đầu\" trong sheet Tổng kết");
+
+        var ws = wb.Worksheet("Lệnh");
+        var col = ws.Row(1).CellsUsed().ToDictionary(c => c.GetString(), c => c.Address.ColumnNumber);
+        int C(string name) => col.TryGetValue(name, out int n) ? n : throw new InvalidDataException($"Thiếu cột \"{name}\"");
+        DateTimeOffset Local(DateTime d) => new(d, TimeZoneInfo.Local.GetUtcOffset(d));
+
+        var trades = new List<PaperTrade>();
+        foreach (var row in ws.RowsUsed().Skip(1))
+        {
+            if (!row.Cell(C("#")).TryGetValue(out double no)) continue; // dòng "Không có lệnh nào…"
+            var side = row.Cell(C("Chiều")).GetString() == "LONG" ? Side.Long : Side.Short;
+            double entry = row.Cell(C("Giá vào")).GetDouble(), tp = row.Cell(C("TP")).GetDouble(), sl = row.Cell(C("SL")).GetDouble();
+            string reason = row.Cell(C("Lý do vào")).GetString();
+            string outcome = row.Cell(C("Kết quả")).GetString();
+            bool closed = outcome != "ĐANG MỞ";
+
+            trades.Add(new PaperTrade
+            {
+                No = (int)no,
+                Side = side,
+                EntryTime = Local(row.Cell(C("Thời gian vào")).GetDateTime()),
+                EntryPrice = entry,
+                TakeProfit = tp,
+                StopLoss = sl,
+                Margin = row.Cell(C("Margin ($)")).GetDouble(),
+                Notional = row.Cell(C("Giá trị vị thế ($)")).GetDouble(),
+                Quantity = row.Cell(C("Số lượng BTC")).GetDouble(),
+                LiquidationPrice = row.Cell(C("Giá thanh lý")).GetDouble(),
+                EntryReason = reason,
+                EntrySignal = new Signal(SignalType.Open, side, reason, entry, tp, sl),
+                // lệnh còn mở sẽ có thêm phần "vì sao đóng" sau này → chỉ giữ ghi chú cũ cho lệnh đã đóng
+                SavedNotes = closed ? row.Cell(C("Ghi chú: vì sao vào lệnh, đặt SL/TP, đóng lệnh")).GetString() : null,
+                Fees = row.Cell(C("Phí ($)")).GetDouble(),
+                ExitTime = closed ? Local(row.Cell(C("Thời gian ra")).GetDateTime()) : null,
+                ExitPrice = closed ? row.Cell(C("Giá ra")).GetDouble() : null,
+                Outcome = closed ? outcome : null,
+                ExitReason = closed ? row.Cell(C("Lý do ra")).GetString() : null,
+                Pnl = closed ? row.Cell(C("Lãi/lỗ ($)")).GetDouble() : 0,
+                EquityAfter = closed ? row.Cell(C("Tài sản sau lệnh ($)")).GetDouble() : 0,
+            });
+        }
+        return (start.Value, startPrice, trades);
     }
 }

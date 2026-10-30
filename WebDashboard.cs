@@ -277,8 +277,12 @@ public sealed class WebDashboard : IDisposable
             note = f.Note,
             session = acc is null ? null : new
             {
-                start = acc.Start.ToUnixTimeMilliseconds(), end = acc.End.ToUnixTimeMilliseconds(),
-                remaining = Math.Max(0, (int)(acc.End - now).TotalSeconds),
+                continuous = acc.Continuous,
+                start = acc.Start.ToUnixTimeMilliseconds(),
+                end = acc.Continuous ? (long?)null : acc.End.ToUnixTimeMilliseconds(),
+                remaining = acc.Continuous ? 0 : Math.Max(0, (int)(acc.End - now).TotalSeconds),
+                uptime = PaperSession.Uptime(now - acc.Start),
+                totalTrades = acc.Trades.Count,
                 capital = acc.InitialCapital, stake = acc.MarginPerTrade, leverage = acc.Leverage, fee = acc.FeePct,
                 equity = acc.Equity(last.Close), balance = acc.Balance, pnl = acc.TotalPnl,
                 wins = acc.Wins, losses = acc.Losses,
@@ -288,15 +292,15 @@ public sealed class WebDashboard : IDisposable
                     side = o.Side == Side.Long ? "LONG" : "SHORT", entry = o.EntryPrice,
                     liq = o.LiquidationPrice, unrealized = acc.Equity(last.Close) - acc.Balance,
                 } : null,
-                trades = acc.Trades.AsEnumerable().Reverse().Select(t => new
+                // chạy liên tục lâu thì danh sách dài: web chỉ hiện 200 lệnh gần nhất, Excel giữ đủ tất cả
+                trades = acc.Trades.AsEnumerable().Reverse().Take(200).Select(t => new
                 {
                     no = t.No, side = t.Side == Side.Long ? "LONG" : "SHORT",
                     entryTime = t.EntryTime.ToUnixTimeMilliseconds(), entry = t.EntryPrice, tp = t.TakeProfit, sl = t.StopLoss,
                     liq = t.LiquidationPrice, rr = Math.Abs(t.TakeProfit - t.EntryPrice) / Math.Abs(t.EntryPrice - t.StopLoss),
                     exitTime = t.ExitTime?.ToUnixTimeMilliseconds(), exit = t.ExitPrice,
                     outcome = t.Outcome ?? "ĐANG MỞ", pnl = t.IsOpen ? (double?)null : t.Pnl, fees = t.Fees,
-                    notes = TradeNotes.Explain(t.EntrySignal, f.Settings, t.Margin, acc.Leverage, acc.FeePct,
-                        t.Outcome, t.ExitReason, t.ExitPrice, t.IsOpen ? null : t.Pnl),
+                    notes = t.Notes(f.Settings, acc.Leverage, acc.FeePct),
                 }),
             },
         };

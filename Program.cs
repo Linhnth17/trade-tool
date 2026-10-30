@@ -14,7 +14,8 @@ Console.OutputEncoding = Encoding.UTF8;
 //   --capital 1000 --stake 10 --leverage 1 : vốn, tiền mỗi lệnh, đòn bẩy cho phiên thử
 //   --port 5001    : mở thêm web dashboard tại http://localhost:5001
 //                    (có biến môi trường PORT, ví dụ trên Render, thì nghe trên mọi địa chỉ ở cổng đó)
-//   --repeat       : đi kèm --session: hết phiên thì tự tổng kết rồi mở phiên mới (chạy liên tục trên server)
+//   --continuous   : giao dịch giả lập chạy liên tục không giới hạn thời gian, mọi lệnh ghi vào MỘT file Excel
+//                    (reports/<SYMBOL>_<INTERVAL>_all.xlsx); khởi động lại thì đọc file đó và chạy tiếp
 //   --headless     : không vẽ chart console, chỉ in log (tự bật khi output bị chuyển hướng, vd. chạy trong Docker)
 var options = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
 var positional = new List<string>();
@@ -30,7 +31,7 @@ double NumOpt(string name, double fallback) =>
 
 bool logMode = options.ContainsKey("log");
 bool replay = options.ContainsKey("replay");
-bool repeat = options.ContainsKey("repeat");
+bool continuous = options.ContainsKey("continuous") && !replay;
 bool headless = options.ContainsKey("headless") || Console.IsOutputRedirected;
 string? envPort = Environment.GetEnvironmentVariable("PORT");
 TimeSpan? sessionLength = options.TryGetValue("session", out var sl) ? ParseInterval(sl ?? "6h") : null;
@@ -92,188 +93,215 @@ PaperSession NewSession(DateTimeOffset start, DateTimeOffset end) => new(
 
 // Phiên chạy thử real-time: bắt đầu từ bây giờ, giữ nguyên qua các lần kết nối lại
 var now0 = DateTimeOffset.UtcNow;
-PaperSession? session = sessionLength is { } len && !replay ? NewSession(now0, now0 + len) : null;
+PaperSession? session =
+    continuous ? ContinuousSession() :
+    sessionLength is { } len && !replay ? NewSession(now0, now0 + len) :
+    null;
 bool sessionDone = false;
 
-while (true)
+// Chạy liên tục: một file duy nhất; có sẵn thì nạp lại toàn bộ lệnh cũ và chạy tiếp
+PaperSession ContinuousSession()
 {
-    while (!cts.IsCancellationRequested && !sessionDone)
+    string path = Path.Combine("reports", $"{displaySymbol}_{interval}_all.xlsx");
+    var start = now0;
+    double startPrice = double.NaN;
+    List<PaperTrade> trades = [];
+    if (File.Exists(path))
     {
         try
         {
-            // 1) Lịch sử
-            dashboard?.SetStatus($"Đang tải {HistoryCandles} nến {displaySymbol} {interval} từ {market}…");
-            var candles = await client.GetHistoryAsync(symbol, interval, HistoryCandles, cts.Token);
-            if (candles.Count < 300) throw new InvalidOperationException($"{market} chỉ trả về {candles.Count} nến, không đủ để tính chỉ báo");
-            Console.WriteLine($"Đã tải {candles.Count} nến {displaySymbol} ({market}) {interval} " +
-                              $"({candles[0].OpenTime.ToLocalTime():dd/MM HH:mm} → {candles[^1].OpenTime.ToLocalTime():dd/MM HH:mm})");
-
-            // 2) Backtest nhanh
-            var bt = Backtester.Run(candles, settings);
-            double winRate = bt.Trades > 0 ? (double)bt.Wins / bt.Trades : 0;
-            Console.WriteLine($"── Backtest · chiến lược {settings.Name} ─────────────");
-            Console.WriteLine($"  Số lệnh: {bt.Trades}, thắng: {bt.Wins} ({winRate:P0})");
-            Console.WriteLine($"  Lợi nhuận chiến lược: {bt.StrategyReturnPct:F2}%  |  Mua & giữ: {bt.BuyAndHoldPct:F2}%");
-            Console.WriteLine($"  Max drawdown: {bt.MaxDrawdownPct:F2}%  (đã tính phí {settings.FeePct:0.00#%}/chiều)");
-            Console.WriteLine("─────────────────────────────────────────");
-
-            // --diag: trong các nến có tín hiệu điểm vào, điều kiện nào chặn lệnh nhiều nhất (để chỉnh bộ lọc)
-            if (options.ContainsKey("diag"))
-            {
-                var ds = new IndicatorSeries(candles, settings);
-                var probe = new MacdTrendStrategy(settings);
-                var fails = new Dictionary<string, int>();
-                int crosses = 0, passed = 0, sidewayBars = 0, ready = 0;
-                for (int i = 0; i < ds.Count; i++)
-                {
-                    var x = ds.At(i);
-                    if (!x.IsReady) continue;
-                    ready++;
-                    if (probe.Regime(x).Sideway) sidewayBars++;
-                    // Classic: điều kiện đầu là MACD cắt; các chế độ mới: điều kiện thứ 3 là điểm vào
-                    int trig = settings.EntryMode == EntryModes.Classic ? 0 : 2;
-                    foreach (var conds in new[] { probe.LongConditions(x), probe.ShortConditions(x) })
-                    {
-                        if (!conds[trig].Ok) continue; // chỉ xét nến có tín hiệu điểm vào đúng chiều
-                        crosses++;
-                        if (conds.All(c => c.Ok)) passed++;
-                        foreach (var c in conds.Where((c, k) => k != trig && !c.Ok))
-                        {
-                            string key = c.Name.Replace("<", "").Replace(">", "").Trim();
-                            fails[key] = fails.GetValueOrDefault(key) + 1;
-                        }
-                    }
-                }
-                Console.WriteLine($"Sideway: {sidewayBars}/{ready} nến ({(double)sidewayBars / ready:P0}). Chế độ {settings.EntryMode}: có tín hiệu điểm vào {crosses}, đủ điều kiện: {passed}");
-                foreach (var (k, v) in fails.OrderByDescending(kv => kv.Value)) Console.WriteLine($"  {v,4} ({(double)v / crosses,4:P0})  {k}");
-                break;
-            }
-
-            // 3) Replay lịch sử để đồng bộ trạng thái (đang giữ lệnh hay không) và lấy các điểm vào/ra cũ
-            PaperSession? replaySession = null;
-            if (replay && sessionLength is { } rl)
-            {
-                var end = candles[^1].OpenTime + period;
-                replaySession = NewSession(end - rl, end);
-                replaySession.StartPrice = candles.Last(c => c.OpenTime + period <= end - rl).Close;
-                replaySession.LastPrice = candles[^1].Close;
-            }
-
-            var strategy = new MacdTrendStrategy(settings);
-            var series = new IndicatorSeries(candles, settings);
-            var markers = new List<TradeMarker>();
-            for (int i = 0; i < series.Count; i++)
-            {
-                var s = series.At(i);
-                replaySession?.Account.OnCandle(candles[i], s.Time + period);
-                foreach (var sig in strategy.Evaluate(s))
-                {
-                    markers.Add(new TradeMarker(s.Time, sig));
-                    replaySession?.Account.OnSignal(sig, s.Time + period); // tín hiệu xác nhận lúc nến đóng
-                }
-            }
-
-            if (replaySession is not null)
-            {
-                replaySession.Account.Finish(replaySession.Account.End, replaySession.LastPrice);
-                replaySession.Save(replaySession.Account.End);
-                replaySession.PrintSummary(replaySession.Account.End);
-                sessionDone = true;
-                break;
-            }
-
-            if (session is not null && double.IsNaN(session.StartPrice)) session.StartPrice = candles[^1].Close;
-
-            if (!logMode)
-            {
-                string note = $"Backtest {bt.Trades} lệnh, thắng {winRate:P0}, " +
-                              $"chiến lược {bt.StrategyReturnPct:+0.00;-0.00}% vs mua&giữ {bt.BuyAndHoldPct:+0.00;-0.00}%";
-                sessionDone = await RunChartAsync(client, symbol, displaySymbol, market, interval, period, candles,
-                    strategy, markers, settings, note, session, dashboard, headless, cts.Token);
-                if (sessionDone) break;
-            }
-            else
-            {
-                Console.WriteLine(strategy.Position is { } side
-                    ? $"Trạng thái: ĐANG {(side == Side.Long ? "LONG" : "SHORT")} (giá vào {strategy.EntryPrice:N2}, " +
-                      $"TP {strategy.TakeProfit:N2}, SL {strategy.StopLoss:N2})"
-                    : "Trạng thái: chờ tín hiệu");
-                PrintSnapshot(series.At(series.Count - 1));
-
-                // 4) Real-time
-                Console.WriteLine($"Đang nghe real-time... (Ctrl+C để thoát)");
-                await foreach (var (candle, isClosed) in client.StreamKlinesAsync(symbol, interval, cts.Token))
-                {
-                    if (session is not null) session.LastPrice = candle.Close;
-                    if (CheckTargetsNow(strategy, candle, session) is { } hit)
-                    {
-                        Console.WriteLine();
-                        PrintSignal(hit);
-                        session?.Save(DateTimeOffset.UtcNow);
-                    }
-                    if (session is not null && SessionFinished(session)) { sessionDone = true; break; }
-                    if (!isClosed)
-                    {
-                        Console.Write($"\r  Giá hiện tại: {candle.Close,12:N2}   ");
-                        continue;
-                    }
-
-                    AddClosed(candles, candle);
-                    series = new IndicatorSeries(candles, settings); // vài nghìn nến, tính lại toàn bộ chỉ mất vài ms
-                    var snap = series.At(series.Count - 1);
-
-                    Console.WriteLine();
-                    PrintSnapshot(snap);
-                    session?.Account.OnCandle(candle, snap.Time + period);
-                    foreach (var signal in strategy.Evaluate(snap))
-                    {
-                        PrintSignal(signal);
-                        session?.Account.OnSignal(signal, snap.Time + period);
-                    }
-                    session?.Save(DateTimeOffset.UtcNow);
-                    if (session is not null && SessionFinished(session)) { sessionDone = true; break; }
-                }
-                if (sessionDone) break;
-            }
-
-            Console.WriteLine("\nWebSocket bị đóng, kết nối lại...");
-        }
-        catch (OperationCanceledException) when (cts.IsCancellationRequested)
-        {
-            break;
+            (start, startPrice, trades) = ExcelReport.Load(path);
+            Console.WriteLine($"Nạp lại {trades.Count} lệnh từ {path} (chạy từ {start.ToLocalTime():dd/MM/yyyy HH:mm})");
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"\nLỗi: {ex.Message}. Thử lại sau 5 giây...");
-            dashboard?.SetStatus($"Lỗi kết nối {market}: {ex.Message} (thử lại sau 5 giây)", error: true);
+            // Không đọc được: cất file cũ sang tên khác chứ không ghi đè mất dữ liệu
+            string backup = Path.ChangeExtension(path, $".hong-{DateTime.Now:yyyyMMdd_HHmmss}.xlsx");
+            File.Move(path, backup);
+            Console.WriteLine($"Không đọc được {path} ({ex.Message}). Đã đổi tên thành {backup}, bắt đầu file mới.");
+        }
+    }
+    var s = new PaperSession(
+        new PaperAccount(capital, stake, leverage, settings.FeePct, start, DateTimeOffset.MaxValue),
+        path, displaySymbol, market, interval, settings) { StartPrice = startPrice };
+    s.Account.Trades.AddRange(trades);
+    return s;
+}
+
+while (!cts.IsCancellationRequested && !sessionDone)
+{
+    try
+    {
+        // 1) Lịch sử
+        dashboard?.SetStatus($"Đang tải {HistoryCandles} nến {displaySymbol} {interval} từ {market}…");
+        var candles = await client.GetHistoryAsync(symbol, interval, HistoryCandles, cts.Token);
+        if (candles.Count < 300) throw new InvalidOperationException($"{market} chỉ trả về {candles.Count} nến, không đủ để tính chỉ báo");
+        Console.WriteLine($"Đã tải {candles.Count} nến {displaySymbol} ({market}) {interval} " +
+                          $"({candles[0].OpenTime.ToLocalTime():dd/MM HH:mm} → {candles[^1].OpenTime.ToLocalTime():dd/MM HH:mm})");
+
+        // 2) Backtest nhanh
+        var bt = Backtester.Run(candles, settings);
+        double winRate = bt.Trades > 0 ? (double)bt.Wins / bt.Trades : 0;
+        Console.WriteLine($"── Backtest · chiến lược {settings.Name} ─────────────");
+        Console.WriteLine($"  Số lệnh: {bt.Trades}, thắng: {bt.Wins} ({winRate:P0})");
+        Console.WriteLine($"  Lợi nhuận chiến lược: {bt.StrategyReturnPct:F2}%  |  Mua & giữ: {bt.BuyAndHoldPct:F2}%");
+        Console.WriteLine($"  Max drawdown: {bt.MaxDrawdownPct:F2}%  (đã tính phí {settings.FeePct:0.00#%}/chiều)");
+        Console.WriteLine("─────────────────────────────────────────");
+
+        // --diag: trong các nến có tín hiệu điểm vào, điều kiện nào chặn lệnh nhiều nhất (để chỉnh bộ lọc)
+        if (options.ContainsKey("diag"))
+        {
+            var ds = new IndicatorSeries(candles, settings);
+            var probe = new MacdTrendStrategy(settings);
+            var fails = new Dictionary<string, int>();
+            int crosses = 0, passed = 0, sidewayBars = 0, ready = 0;
+            for (int i = 0; i < ds.Count; i++)
+            {
+                var x = ds.At(i);
+                if (!x.IsReady) continue;
+                ready++;
+                if (probe.Regime(x).Sideway) sidewayBars++;
+                // Classic: điều kiện đầu là MACD cắt; các chế độ mới: điều kiện thứ 3 là điểm vào
+                int trig = settings.EntryMode == EntryModes.Classic ? 0 : 2;
+                foreach (var conds in new[] { probe.LongConditions(x), probe.ShortConditions(x) })
+                {
+                    if (!conds[trig].Ok) continue; // chỉ xét nến có tín hiệu điểm vào đúng chiều
+                    crosses++;
+                    if (conds.All(c => c.Ok)) passed++;
+                    foreach (var c in conds.Where((c, k) => k != trig && !c.Ok))
+                    {
+                        string key = c.Name.Replace("<", "").Replace(">", "").Trim();
+                        fails[key] = fails.GetValueOrDefault(key) + 1;
+                    }
+                }
+            }
+            Console.WriteLine($"Sideway: {sidewayBars}/{ready} nến ({(double)sidewayBars / ready:P0}). Chế độ {settings.EntryMode}: có tín hiệu điểm vào {crosses}, đủ điều kiện: {passed}");
+            foreach (var (k, v) in fails.OrderByDescending(kv => kv.Value)) Console.WriteLine($"  {v,4} ({(double)v / crosses,4:P0})  {k}");
+            break;
         }
 
-        try { await Task.Delay(TimeSpan.FromSeconds(5), cts.Token); }
-        catch (OperationCanceledException) { break; }
+        // 3) Replay lịch sử để đồng bộ trạng thái (đang giữ lệnh hay không) và lấy các điểm vào/ra cũ
+        PaperSession? replaySession = null;
+        if (replay && sessionLength is { } rl)
+        {
+            var end = candles[^1].OpenTime + period;
+            replaySession = NewSession(end - rl, end);
+            replaySession.StartPrice = candles.Last(c => c.OpenTime + period <= end - rl).Close;
+            replaySession.LastPrice = candles[^1].Close;
+        }
+
+        var strategy = new MacdTrendStrategy(settings);
+        var series = new IndicatorSeries(candles, settings);
+        var markers = new List<TradeMarker>();
+        for (int i = 0; i < series.Count; i++)
+        {
+            var s = series.At(i);
+            replaySession?.Account.OnCandle(candles[i], s.Time + period);
+            foreach (var sig in strategy.Evaluate(s))
+            {
+                markers.Add(new TradeMarker(s.Time, sig));
+                replaySession?.Account.OnSignal(sig, s.Time + period); // tín hiệu xác nhận lúc nến đóng
+            }
+        }
+
+        if (replaySession is not null)
+        {
+            replaySession.Account.Finish(replaySession.Account.End, replaySession.LastPrice);
+            replaySession.Save(replaySession.Account.End);
+            replaySession.PrintSummary(replaySession.Account.End);
+            sessionDone = true;
+            break;
+        }
+
+        if (session is not null && double.IsNaN(session.StartPrice)) session.StartPrice = candles[^1].Close;
+
+        if (!logMode)
+        {
+            string note = $"Backtest {bt.Trades} lệnh, thắng {winRate:P0}, " +
+                          $"chiến lược {bt.StrategyReturnPct:+0.00;-0.00}% vs mua&giữ {bt.BuyAndHoldPct:+0.00;-0.00}%";
+            sessionDone = await RunChartAsync(client, symbol, displaySymbol, market, interval, period, candles,
+                strategy, markers, settings, note, session, dashboard, headless, cts.Token);
+            if (sessionDone) break;
+        }
+        else
+        {
+            Console.WriteLine(strategy.Position is { } side
+                ? $"Trạng thái: ĐANG {(side == Side.Long ? "LONG" : "SHORT")} (giá vào {strategy.EntryPrice:N2}, " +
+                  $"TP {strategy.TakeProfit:N2}, SL {strategy.StopLoss:N2})"
+                : "Trạng thái: chờ tín hiệu");
+            PrintSnapshot(series.At(series.Count - 1));
+
+            // 4) Real-time
+            Console.WriteLine($"Đang nghe real-time... (Ctrl+C để thoát)");
+            await foreach (var (candle, isClosed) in client.StreamKlinesAsync(symbol, interval, cts.Token))
+            {
+                if (session is not null) session.LastPrice = candle.Close;
+                if (CheckTargetsNow(strategy, candle, session) is { } hit)
+                {
+                    Console.WriteLine();
+                    PrintSignal(hit);
+                    session?.Save(DateTimeOffset.UtcNow);
+                }
+                if (session is not null && SessionFinished(session)) { sessionDone = true; break; }
+                if (!isClosed)
+                {
+                    Console.Write($"\r  Giá hiện tại: {candle.Close,12:N2}   ");
+                    continue;
+                }
+
+                AddClosed(candles, candle);
+                series = new IndicatorSeries(candles, settings); // vài nghìn nến, tính lại toàn bộ chỉ mất vài ms
+                var snap = series.At(series.Count - 1);
+
+                Console.WriteLine();
+                PrintSnapshot(snap);
+                session?.Account.OnCandle(candle, snap.Time + period);
+                foreach (var signal in strategy.Evaluate(snap))
+                {
+                    PrintSignal(signal);
+                    session?.Account.OnSignal(signal, snap.Time + period);
+                }
+                session?.Save(DateTimeOffset.UtcNow);
+                if (session is not null && SessionFinished(session)) { sessionDone = true; break; }
+            }
+            if (sessionDone) break;
+        }
+
+        Console.WriteLine("\nWebSocket bị đóng, kết nối lại...");
+    }
+    catch (OperationCanceledException) when (cts.IsCancellationRequested)
+    {
+        break;
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"\nLỗi: {ex.Message}. Thử lại sau 5 giây...");
+        dashboard?.SetStatus($"Lỗi kết nối {market}: {ex.Message} (thử lại sau 5 giây)", error: true);
     }
 
-    // Kết thúc phiên: hết giờ và lệnh cuối đã chạm TP/SL, hoặc Ctrl+C giữa chừng (đóng lệnh đang mở ở giá hiện tại)
-    if (session is not null && !double.IsNaN(session.LastPrice))
+    try { await Task.Delay(TimeSpan.FromSeconds(5), cts.Token); }
+    catch (OperationCanceledException) { break; }
+}
+
+// Dừng app (Ctrl+C / server tắt) hoặc phiên có hạn đã hết giờ
+if (session is not null && !double.IsNaN(session.LastPrice))
+{
+    var acc = session.Account;
+    var now = DateTimeOffset.UtcNow;
+    if (acc.Continuous)
     {
-        var acc = session.Account;
-        var now = DateTimeOffset.UtcNow;
+        // Chạy liên tục: KHÔNG đóng lệnh đang mở — lưu nguyên trạng để lần chạy sau nạp lại và chạy tiếp
+        session.Save(now);
+        session.PrintSummary(now);
+    }
+    else
+    {
         var lastExit = acc.Trades.Select(t => t.ExitTime).LastOrDefault() ?? acc.End;
         var end = acc.Open is not null || now < acc.End ? now : (lastExit > acc.End ? lastExit : acc.End);
         acc.Finish(end, session.LastPrice);
         session.Save(end);
         session.PrintSummary(end);
     }
-
-    // --repeat: phiên vừa hết giờ (không phải do tắt app) → mở phiên mới, chạy liên tục
-    if (repeat && sessionDone && session is not null && sessionLength is { } nextLen && !cts.IsCancellationRequested)
-    {
-        var t = DateTimeOffset.UtcNow;
-        session = NewSession(t, t + nextLen);
-        sessionDone = false;
-        Console.WriteLine($"Bắt đầu phiên mới: {t.ToLocalTime():dd/MM HH:mm} → {(t + nextLen).ToLocalTime():dd/MM HH:mm}");
-        continue;
-    }
-    break;
 }
 
 Console.WriteLine("Đã dừng.");

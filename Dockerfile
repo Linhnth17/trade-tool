@@ -21,7 +21,7 @@ COPY --from=build /app .
 ENV PORT=8080
 EXPOSE 8080
 
-# Chạy liên tục: mỗi phiên 24h, hết phiên tự xuất Excel rồi mở phiên mới.
+# Chạy liên tục không nghỉ, mọi lệnh ghi vào một file reports/BTCUSDT.P_5m_all.xlsx.
 # Đổi tham số ở đây (hoặc "Docker Command" trên Render) nếu muốn: nến, vốn, tiền mỗi lệnh, đòn bẩy...
 ENTRYPOINT ["dotnet", "BtcSignalBot.dll"]
-CMD ["BTCUSDT.P", "5m", "--session", "24h", "--repeat", "--capital", "1000", "--stake", "10", "--leverage", "100", "--headless"]
+CMD ["BTCUSDT.P", "5m", "--continuous", "--capital", "1000", "--stake", "10", "--leverage", "100", "--headless"]
